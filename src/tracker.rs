@@ -18,19 +18,18 @@ use anyhow::{Context, Result};
 use crate::config;
 use crate::scheduler::unregistered_info_hash_update::{self, UnregisteredInfoHashUpdate};
 use crate::scheduler::{
-    announce_update,
+    Queue, QueueConfig, announce_update,
     history_update::{self, HistoryUpdate},
     peer_update::{self, PeerUpdate},
     torrent_update::{self, TorrentUpdate},
     user_update::{self, UserUpdate},
-    Queue, QueueConfig,
 };
 use crate::stats::Stats;
 
 use dotenvy::dotenv;
 use parking_lot::{Mutex, RwLock};
-use sqlx::mysql::MySqlPoolOptions;
 use sqlx::Connection;
+use sqlx::mysql::MySqlPoolOptions;
 use std::io::{self, Write};
 use std::{env, sync::Arc, time::Duration};
 
@@ -201,7 +200,7 @@ async fn connect_to_database() -> sqlx::Pool<sqlx::MySql> {
     // Get pool of database connections.
     MySqlPoolOptions::new()
         .min_connections(0)
-        .max_connections(10)
+        .max_connections(60)
         .max_lifetime(Duration::from_secs(30 * 60))
         .idle_timeout(Duration::from_secs(10 * 60))
         .acquire_timeout(Duration::from_secs(30))

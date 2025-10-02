@@ -1,4 +1,4 @@
-use std::{cmp::min, hash::Hash, sync::Arc};
+use std::{cmp::min, collections::VecDeque, hash::Hash, slice::Iter, sync::Arc, vec::IntoIter};
 
 pub mod announce_update;
 pub mod history_update;
@@ -9,11 +9,9 @@ pub mod user_update;
 
 use crate::tracker::Tracker;
 use chrono::{Duration, Utc};
-use indexmap::{
-    map::{IntoIter, Iter},
-    IndexMap,
-};
+use futures_util::future::join_all;
 use parking_lot::Mutex;
+use ringmap::RingMap;
 use tokio::{join, time::Instant};
 use torrent_update::{Index, TorrentUpdate};
 use tracing::info;
@@ -89,7 +87,7 @@ pub async fn reap(tracker: &Arc<Tracker>) {
             .peers
             .retain(|_index, peer| inactive_cutoff <= peer.updated_at || peer.is_active);
 
-        for (_index, peer) in torrent.peers.iter_mut() {
+        for (index, peer) in torrent.peers.iter_mut() {
             // Peers get marked as inactive if not announced for more than
             // active_peer_ttl seconds. User peer count and torrent peer
             // count are updated to reflect.
@@ -100,7 +98,7 @@ pub async fn reap(tracker: &Arc<Tracker>) {
                     tracker
                         .users
                         .write()
-                        .entry(peer.user_id)
+                        .entry(index.user_id)
                         .and_modify(|user| {
                             if peer.is_seeder {
                                 user.num_seeding = user.num_seeding.saturating_sub(1);
@@ -137,7 +135,7 @@ pub async fn reap(tracker: &Arc<Tracker>) {
 }
 
 pub struct Queue<K, V> {
-    records: IndexMap<K, V>,
+    records: RingMap<K, V>,
     config: QueueConfig,
 }
 
@@ -148,8 +146,15 @@ pub struct QueueConfig {
 }
 
 impl QueueConfig {
-    fn max_batch_size(&mut self) -> usize {
-        (self.max_bindings_per_flush - self.extra_bindings_per_flush) / self.bindings_per_record
+    fn max_batch_size(&mut self, tracker: &Arc<Tracker>) -> usize {
+        let max_bindings = (self.max_bindings_per_flush - self.extra_bindings_per_flush)
+            / self.bindings_per_record;
+
+        if let Some(max_records) = tracker.config.read().max_records_per_batch {
+            return max_bindings.min(max_records);
+        }
+
+        max_bindings
     }
 }
 
@@ -161,7 +166,7 @@ where
     /// Initialize a new queue
     pub fn new(config: QueueConfig) -> Queue<K, V> {
         Self {
-            records: IndexMap::new(),
+            records: RingMap::new(),
             config,
         }
     }
@@ -176,15 +181,25 @@ where
 
     /// Take a portion of the updates from the start of the queue with a max
     /// size defined by the buffer config
-    fn take_batch(&mut self) -> Batch<K, V> {
-        let mut batch = self
+    fn take_batches(&mut self, tracker: &Arc<Tracker>) -> VecDeque<Batch<K, V>> {
+        let max_batches = tracker.config.read().max_batches_per_flush;
+        let max_batch_size = self.config.max_batch_size(tracker);
+
+        let mut records = self
             .records
-            .drain(0..min(self.records.len(), self.config.max_batch_size()))
-            .collect::<IndexMap<K, V>>();
+            .drain(0..min(self.records.len(), max_batches * max_batch_size))
+            .collect::<Vec<(K, V)>>();
 
-        batch.sort_unstable_keys();
+        records.sort_unstable_by(move |a, b| K::cmp(&a.0, &b.0));
 
-        Batch(batch)
+        let mut batches = VecDeque::new();
+
+        while records.len() > 0 {
+            let batch = records.split_off(records.len() - min(records.len(), max_batch_size));
+            batches.push_front(Batch(batch));
+        }
+
+        batches
     }
 
     /// Bulk upsert a batch into the end of the queue
@@ -213,36 +228,54 @@ where
     Batch<K, V>: Flushable<V>,
 {
     async fn flush<'a>(&self, tracker: &Arc<Tracker>, record_type: &'a str) {
-        let batch = self.lock().take_batch();
-        let start = Instant::now();
-        let len = batch.len();
-        let result = batch.flush_to_db(tracker).await;
-        let elapsed = start.elapsed().as_millis();
+        let batches = self.lock().take_batches(tracker);
 
-        match result {
-            Ok(_) => {
-                info!("Upserted {len} {record_type} in {elapsed} ms.");
-            }
-            Err(e) => {
-                info!("Failed to update {len} {record_type} after {elapsed} ms: {e}");
-                self.lock().upsert_batch(batch);
+        if batches.is_empty() {
+            info!("Upserted 0 {record_type} in 0 ms.");
+
+            return;
+        }
+
+        let tasks = batches
+            .into_iter()
+            .map(|batch| async move {
+                let start = Instant::now();
+                let len = batch.len();
+                let result = batch.flush_to_db(tracker).await;
+                let elapsed = start.elapsed().as_millis();
+
+                (len, elapsed, result, batch)
+            })
+            .collect::<Vec<_>>();
+
+        let results = join_all(tasks).await;
+
+        for (len, elapsed, result, batch) in results {
+            match result {
+                Ok(_) => {
+                    info!("Upserted {len} {record_type} in {elapsed} ms.");
+                }
+                Err(e) => {
+                    info!("Failed to update {len} {record_type} after {elapsed} ms: {e}",);
+                    self.lock().upsert_batch(batch);
+                }
             }
         }
     }
 }
 
-pub struct Batch<K, V>(IndexMap<K, V>);
+pub struct Batch<K, V>(Vec<(K, V)>);
 
 impl<'a, K, V> Batch<K, V> {
     fn is_empty(&self) -> bool {
         self.0.len() == 0
     }
 
-    fn iter(&'a self) -> Iter<'a, K, V> {
+    fn iter(&'a self) -> Iter<'a, (K, V)> {
         self.0.iter()
     }
 
-    fn into_iter(self) -> IntoIter<K, V> {
+    fn into_iter(self) -> IntoIter<(K, V)> {
         self.0.into_iter()
     }
 

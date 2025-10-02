@@ -1,13 +1,13 @@
 use axum::{
     extract::{ConnectInfo, FromRef, FromRequestParts, Path, State},
     http::{
+        HeaderMap,
         header::{ACCEPT_CHARSET, ACCEPT_LANGUAGE, REFERER, USER_AGENT},
         request::Parts,
-        HeaderMap,
     },
 };
 use chrono::Duration;
-use rand::{seq::IteratorRandom, thread_rng, Rng};
+use rand::{Rng, rng, seq::IteratorRandom};
 use sqlx::types::chrono::Utc;
 use std::{
     fmt::Display,
@@ -37,11 +37,11 @@ use crate::{
         unregistered_info_hash_update::{self, UnregisteredInfoHashUpdate},
         user_update::{self, UserUpdate},
     },
-    warning::AnnounceWarning,
+    warning::{AnnounceWarning, WarningCollection},
 };
 
 use crate::tracker::{
-    self,
+    self, Tracker,
     connectable_port::ConnectablePort,
     featured_torrent::FeaturedTorrent,
     freeleech_token::FreeleechToken,
@@ -49,7 +49,6 @@ use crate::tracker::{
     personal_freeleech::PersonalFreeleech,
     torrent::InfoHash,
     user::Passkey,
-    Tracker,
 };
 use crate::utils;
 
@@ -361,12 +360,12 @@ pub async fn announce(
 
     let is_connectable = check_connectivity(&tracker, client_ip, queries.port).await;
 
-    let mut warnings: Vec<AnnounceWarning> = Vec::new();
+    let mut warnings = WarningCollection::new();
 
     let config = tracker.config.read();
 
     if !is_connectable && config.require_peer_connectivity {
-        warnings.push(AnnounceWarning::ConnectivityIssueDetected);
+        warnings.add(AnnounceWarning::ConnectivityIssueDetected);
     }
 
     let (
@@ -378,12 +377,13 @@ pub async fn announce(
         leecher_delta,
         times_completed_delta,
         is_visible,
+        is_active_after_stop,
         user,
         user_id,
         group,
         has_requested_seed_list,
         has_requested_leech_list,
-        warnings,
+        should_early_return,
         response,
     ) = {
         let mut torrent_guard = tracker.torrents.lock();
@@ -438,6 +438,7 @@ pub async fn announce(
         let leecher_delta;
         let times_completed_delta;
         let is_visible;
+        let mut is_active_after_stop = false;
 
         if queries.event == Event::Stopped {
             // Try and remove the peer
@@ -454,6 +455,14 @@ pub async fn announce(
 
                 leecher_delta = 0 - peer.is_included_in_leech_list(&config) as i32;
                 seeder_delta = 0 - peer.is_included_in_seed_list(&config) as i32;
+
+                for (&index, &peer) in torrent.peers.iter() {
+                    if index.user_id == user_id && peer.is_active {
+                        is_active_after_stop = true;
+
+                        break;
+                    }
+                }
             } else {
                 // Some clients (namely transmission) will keep sending
                 // `stopped` events until a successful announce is received.
@@ -465,7 +474,7 @@ pub async fn announce(
                 // of sending `stopped` events. To prevent this, we need to
                 // send a warning (i.e. succcessful announce) instead, so that
                 // the client can successfully restart its session.
-                warnings.push(AnnounceWarning::StoppedPeerDoesntExist);
+                warnings.add(AnnounceWarning::StoppedPeerDoesntExist);
                 leecher_delta = 0;
                 seeder_delta = 0;
                 uploaded_delta = 0;
@@ -493,19 +502,20 @@ pub async fn announce(
                     peer.is_visible =
                         peer.is_included_in_leech_list(&config) || !has_hit_download_slot_limit;
                     peer.is_active = true;
+                    peer.has_sent_completed =
+                        peer.has_sent_completed || queries.event == Event::Completed;
                     peer.updated_at = now;
                     peer.uploaded = queries.uploaded;
                     peer.downloaded = queries.downloaded;
                 })
                 .or_insert(tracker::Peer {
                     ip_address: client_ip,
-                    user_id,
-                    torrent_id,
                     port: queries.port,
                     is_seeder: queries.left == 0,
                     is_active: true,
                     is_visible: !has_hit_download_slot_limit,
                     is_connectable,
+                    has_sent_completed: queries.event == Event::Completed,
                     updated_at: now,
                     uploaded: queries.uploaded,
                     downloaded: queries.downloaded,
@@ -515,7 +525,7 @@ pub async fn announce(
 
             // Warn user if download slots are full
             if !is_visible {
-                warnings.push(AnnounceWarning::HitDownloadSlotLimit);
+                warnings.add(AnnounceWarning::HitDownloadSlotLimit);
             };
 
             // Update the user and torrent seeding/leeching counts in the
@@ -544,13 +554,15 @@ pub async fn announce(
                     }
 
                     // Warn user if peer last announced less than
-                    // announce_min_enforced seconds ago
+                    // announce_min_enforced seconds ago and it's
+                    // not their first completed event
                     if old_peer
                         .updated_at
                         .checked_add_signed(Duration::seconds(config.announce_min_enforced.into()))
                         .is_some_and(|blocked_until| blocked_until > now)
+                        && (queries.event != Event::Completed || old_peer.has_sent_completed)
                     {
-                        warnings.push(AnnounceWarning::RateLimitExceeded);
+                        warnings.add(AnnounceWarning::RateLimitExceeded);
                     }
                 }
                 None => {
@@ -559,8 +571,8 @@ pub async fn announce(
                     // Make sure user is only allowed N peers per torrent.
                     let mut peer_count = 0;
 
-                    for &peer in torrent.peers.values() {
-                        if peer.user_id == user_id && peer.is_active {
+                    for (&index, &peer) in torrent.peers.iter() {
+                        if index.user_id == user_id && peer.is_active {
                             peer_count += 1;
 
                             if peer_count > config.max_peers_per_torrent_per_user {
@@ -587,6 +599,9 @@ pub async fn announce(
                 }
             }
         }
+
+        // Compute this before we convert the warnings into a message.
+        let should_early_return = warnings.should_early_return();
 
         // Has to be adjusted before the peer list is generated
         torrent.seeders = torrent.seeders.saturating_add_signed(seeder_delta);
@@ -616,8 +631,8 @@ pub async fn announce(
             ));
 
             // Don't return peers with the same user id or those that are marked as inactive
-            let valid_peers = torrent.peers.iter().filter(|(_index, peer)| {
-                peer.user_id != user_id && peer.is_included_in_peer_list(&config)
+            let valid_peers = torrent.peers.iter().filter(|(index, peer)| {
+                index.user_id != user_id && peer.is_included_in_peer_list(&config)
             });
 
             // Make sure leech peer lists are filled with seeds
@@ -629,7 +644,7 @@ pub async fn announce(
                         valid_peers
                             .clone()
                             .filter(|(_index, peer)| peer.is_seeder)
-                            .choose_multiple(&mut thread_rng(), queries.numwant),
+                            .choose_multiple(&mut rng(), queries.numwant),
                     );
                 } else {
                     is_over_seed_list_rate_limit = true;
@@ -645,7 +660,7 @@ pub async fn announce(
                         valid_peers
                             .filter(|(_index, peer)| !peer.is_seeder)
                             .choose_multiple(
-                                &mut thread_rng(),
+                                &mut rng(),
                                 queries.numwant.saturating_sub(peers.len()),
                             ),
                     );
@@ -672,7 +687,7 @@ pub async fn announce(
 
         // Generate bencoded response to return to client
 
-        let interval = thread_rng().gen_range(config.announce_min..=config.announce_max);
+        let interval = rng().random_range(config.announce_min..=config.announce_max);
 
         // Write out bencoded response (keys must be sorted to be within spec)
         let mut response: Vec<u8> = Vec::with_capacity(
@@ -680,7 +695,7 @@ pub async fn announce(
                 + 5 * 5 // numbers with estimated digit quantity for each
                 + peers_ipv4.len() * 6 + 5 // bytes per ipv4 plus estimated length prefix
                 + peers_ipv6.len() * 18 + 5 // bytes per ipv6 plus estimated length prefix
-                + warnings.len() * (64 + 2), // max bytes per warning message plus separator
+                + warnings.max_byte_length(), // max bytes per warning message plus separator
         );
 
         response.extend(b"d8:completei");
@@ -722,16 +737,7 @@ pub async fn announce(
             response.extend(peers_ipv6);
         }
 
-        if !warnings.is_empty() {
-            let mut warning_message: Vec<u8> = Vec::with_capacity((64 + 2) * warnings.len());
-
-            for i in 0..(warnings.len() - 1) {
-                warning_message.extend(warnings.get(i).expect("in range").to_string().as_bytes());
-                warning_message.extend(b"; ")
-            }
-
-            warning_message.extend(warnings.last().expect("not empty").to_string().as_bytes());
-
+        if let Some(warning_message) = warnings.into_message() {
             response.extend(b"15:warning message");
             response.extend(warning_message.len().to_string().as_bytes());
             response.extend(b":");
@@ -789,19 +795,20 @@ pub async fn announce(
             leecher_delta,
             times_completed_delta,
             is_visible,
+            is_active_after_stop,
             user,
             user_id,
             group,
             has_requested_seed_list,
             has_requested_leech_list,
-            warnings,
+            should_early_return,
             response,
         )
     };
 
     // Short circuit response for stopped peer doesn't exist error since we
     // can't do anything with it and don't want to update any data.
-    if warnings.contains(&AnnounceWarning::StoppedPeerDoesntExist) {
+    if should_early_return {
         return Ok(response);
     }
 
@@ -890,7 +897,7 @@ pub async fn announce(
         },
         HistoryUpdate {
             user_agent: String::from(user_agent),
-            is_active: queries.event != Event::Stopped,
+            is_active: queries.event != Event::Stopped || is_active_after_stop,
             is_seeder: queries.left == 0,
             is_immune: if user.is_lifetime {
                 config

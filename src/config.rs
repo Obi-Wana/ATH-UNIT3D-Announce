@@ -1,6 +1,6 @@
-use std::{env, net::IpAddr, num::NonZeroU64, sync::Arc};
+use std::{env, net::IpAddr, num::NonZeroU64, path::PathBuf, sync::Arc};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -16,6 +16,14 @@ pub struct Config {
     /// The interval (in milliseconds) between when history, peers, torrents and
     /// users are flushed to the main mysql database.
     pub flush_interval_milliseconds: u64,
+    /// Amount of concurrent SQL queries per table flush. Use 1 and decrease
+    /// the flush interval as necessary unless handling more than 10 000
+    /// announces per second.
+    pub max_batches_per_flush: usize,
+    /// If specified, limits the amount of records upserted in each SQL query.
+    /// Can be used to distribute increased load across multiple SQL queries.
+    /// If unspecified, uses the max bindings allowed per SQL query.
+    pub max_records_per_batch: Option<usize>,
     /// The amount of peers that should be sent back if the peer does not
     /// include a numwant.
     pub numwant_default: usize,
@@ -55,9 +63,12 @@ pub struct Config {
     /// Must be at least 32 characters long and should be properly randomized.
     pub apikey: String,
     /// IP address for the tracker to listen from to receive announces.
-    pub listening_ip_address: IpAddr,
+    pub listening_ip_address: Option<IpAddr>,
     /// Port for the tracker to listen from to receive announces.
-    pub listening_port: u16,
+    pub listening_port: Option<u16>,
+    /// Path to unix domain socket to listen from to receive announces from
+    /// reverse proxy.
+    pub listening_unix_socket: Option<PathBuf>,
     /// Max amount of active peers a user is allowed to have on a torrent.
     /// Prevents abuse from malicious users causing the server to run out of ram,
     /// as well as keeps the peer lists from being filled with too many clients
@@ -80,7 +91,8 @@ pub struct Config {
     /// The header provided by the reverse proxy that includes the bittorrent
     /// client's original ip address. The last address in the comma separated
     /// list will be selected. Leave empty to select the connecting ip address
-    /// if not using a reverse proxy.
+    /// if not using a reverse proxy. A reverse proxy is required if listening
+    /// on unix sockets.
     pub reverse_proxy_client_ip_header_name: Option<String>,
     /// The max amount of peer lists containing seeds a user is allowed to
     /// receive per time window (in seconds). The rate is calculated using an
@@ -120,6 +132,19 @@ impl Config {
             .context("FLUSH_INTERVAL_MILLISECONDS not found in .env file.")?
             .parse()
             .context("FLUSH_INTERVAL_MILLISECONDS must be a number between 1 and 2^64 - 1")?;
+
+        let max_batches_per_flush = env::var("MAX_BATCHES_PER_FLUSH")
+            .context("MAX_BATCHES_PER_FLUSH not found in .env file.")?
+            .parse()
+            .context("MAX_BATCHES_PER_FLUSH must be a number between 0 and 2^64 - 1")?;
+
+        let max_records_per_batch = env::var("MAX_RECORDS_PER_BATCH")
+            .ok()
+            .map(|s| s.parse())
+            .transpose()
+            .context(
+                "MAX_RECORDS_PER_BATCH must be a number between 0 and 2^64 - 1, if provided",
+            )?;
 
         let numwant_default = env::var("NUMWANT_DEFAULT")
             .context("NUMWANT_DEFAULT not found in .env file.")?
@@ -187,14 +212,37 @@ impl Config {
             .context("INACTIVE_PEER_TTL must be a number between 0 and 2^64 - 1")?;
 
         let listening_ip_address = env::var("LISTENING_IP_ADDRESS")
-            .context("LISTENING_IP_ADDRESS not found in .env file.")?
-            .parse()
+            .ok()
+            .map(|s| s.parse())
+            .transpose()
             .context("LISTENING_IP_ADDRESS in .env file could not be parsed.")?;
 
         let listening_port = env::var("LISTENING_PORT")
-            .context("LISTENING_PORT not found in .env file.")?
-            .parse()
+            .ok()
+            .map(|s| s.parse())
+            .transpose()
             .context("LISTENING_PORT must be a number between 0 and 2^16 - 1")?;
+
+        let listening_unix_socket = env::var("LISTENING_UNIX_SOCKET")
+            .ok()
+            .map(|s| s.parse())
+            .transpose()
+            .context("LISTENING_UNIX_SOCKET could not be parsed into a unix domain socket path.")?;
+
+        ensure!(
+            listening_ip_address.is_some() == listening_port.is_some(),
+            "LISTENING_IP_ADDRESS and LISTENING PORT must be configured together."
+        );
+
+        ensure!(
+            (listening_ip_address.is_some()
+                && listening_port.is_some()
+                && listening_unix_socket.is_none())
+                || (listening_ip_address.is_none()
+                    && listening_port.is_none()
+                    && listening_unix_socket.is_some()),
+            "(LISTENING_IP_ADDRESS and LISTENING_PORT) AND LISTENING_UNIX_SOCKET are mutually exclusive"
+        );
 
         let max_peers_per_torrent_per_user = env::var("MAX_PEERS_PER_TORRENT_PER_USER")
             .context("MAX_PEERS_PER_TORRENT_PER_USER not found in .env file.")?
@@ -223,6 +271,13 @@ impl Config {
 
         let reverse_proxy_client_ip_header_name =
             env::var("REVERSE_PROXY_CLIENT_IP_HEADER_NAME").ok();
+
+        if listening_unix_socket.is_some() {
+            ensure!(
+                reverse_proxy_client_ip_header_name.is_some(),
+                "LISTENING_UNIX_SOCKET requires REVERSE_PROXY_CLIENT_IP_HEADER_NAME to be configured."
+            );
+        }
 
         let user_receive_seed_list_rate_limits = RateCollection::new_from_string(
             &env::var("USER_RECEIVE_SEED_LIST_RATE_LIMITS")
@@ -294,6 +349,8 @@ impl Config {
 
         Ok(Config {
             flush_interval_milliseconds: flush_interval_milliseconds.into(),
+            max_batches_per_flush,
+            max_records_per_batch,
             numwant_default,
             numwant_max,
             announce_min,
@@ -307,6 +364,7 @@ impl Config {
             apikey,
             listening_ip_address,
             listening_port,
+            listening_unix_socket,
             max_peers_per_torrent_per_user,
             is_connectivity_check_enabled,
             connectivity_check_interval,
