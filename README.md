@@ -84,7 +84,7 @@ Paste the following `location` block into the first `server` block immediately a
         proxy_set_header Host $host;
         # Uncomment one of the following:
         # proxy_pass http://aaa.bbb.ccc.ddd:eee$request_uri;
-        # proxy_pass http://unix:/run/unit3d-announce.sock;
+        # proxy_pass http://unix:/run/unit3d-announce/unit3d-announce.sock;
         real_ip_header X-Forwarded-For;
         real_ip_recursive on;
         set_real_ip_from fff.ggg.hhh.iii;
@@ -92,7 +92,7 @@ Paste the following `location` block into the first `server` block immediately a
 ```
 
 - `aaa.bbb.ccc.ddd:eeee` is the local listening IP address and port of UNIT3D-Announce if listening on TCP sockets. Set this to the `LISTENING_IP_ADDRESS` and `LISTENING_PORT` configured in the .env file.
-- `http://unix:/run/unit3d-announce.sock` is the local listening unix socket if listening on unix sockets. Set the path of this (`/run/unit3d-announce.sock`) to `LISTENING_UNIX_SOCKET` configured in the .env file.
+- `http://unix:/run/unit3d-announce/unit3d-announce.sock` is the local listening unix socket if listening on unix sockets. Set the path of this (`/run/unit3d-announce/unit3d-announce.sock`) to `LISTENING_UNIX_SOCKET` configured in the .env file.
 - `fff.ggg.hhh.iii` is the public listening IP address of the nginx proxy used for accessing the frontend website. You can add additional `set_real_ip_from jjj.kkk.lll.mmm/nn;` lines for each additional proxy used so long as the proxy appends the proper values to the `X-Forwarded-For` header. Replace this with your proxy IP address.
 
 Uncomment and set `REVERSE_PROXY_CLIENT_IP_HEADER_NAME` in the .env file to `X-Real-IP`.
@@ -128,6 +128,13 @@ redirect_stderr=true
 stdout_logfile=/var/www/html/storage/logs/announce.log
 ```
 
+**Set Up Runtime Directory (if using Unix sockets):**
+
+If using Unix sockets, create a `/run` directory for `ubuntu` user:
+1. `sudo nano /etc/tmpfiles.d/unit3d-announce.conf`
+2. Add: `d /run/unit3d-announce 0755 ubuntu www-data -`
+3. Run: `sudo systemd-tmpfiles --create`
+
 ### Starting/Restarting UNIT3D-Announce
 
 Reload supervisor
@@ -149,7 +156,7 @@ sudo supervisorctl stop unit3d-announce:unit3d-announce_00
 > [!IMPORTANT]
 > When using the Rust-based UNIT3D-Announce tracker, the global freeleech and double upload events are handled by the external tracker itself. This means you must activate the events in the `config/other.php` file within UNIT3D as normal to show the timer and then also within the `.env` file of the UNIT3D-Announce tracker to update user stats correctly.
 
-To enable/disable global freeleech or double upload events, you need to adjust the following environment variables in the `.env` file and then [restart the tracker](#startingrestarting-unit3d-announce).
+To enable/disable global freeleech or double upload events, you need to adjust the following environment variables in the `.env` file and then either [reload the configuration](#reload) or [restart the tracker](#startingrestarting-unit3d-announce).
 
 ```sh
 # The upload_factor is multiplied by 0.01 before being multiplied with
